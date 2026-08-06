@@ -1,0 +1,2 @@
+# CSI300-quant-multifactor-Stock-Selection-Model
+CSI300 quant multifactor Stock Selection Model: Construction, Diagnosis, and Out-of-Sample Validation
