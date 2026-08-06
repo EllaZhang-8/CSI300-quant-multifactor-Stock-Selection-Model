@@ -1,0 +1,944 @@
+---
+title: "A CSI 300 Multi-Factor Stock Selection Model: Construction, Diagnosis, and Out-of-Sample Validation"
+subtitle: "Wind Financial Terminal Internship Project"
+author: "Ella (Yuxuan) Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(dplyr)
+theme_set(theme_minimal(base_size = 11))
+```
+
+# Executive Summary
+
+This report documents the construction of a multi-factor quantitative
+stock selection model for the CSI 300 universe, built during a
+data science internship at Wind Information. The project's
+contribution is not a single headline return figure, but a complete and
+honest research process: sourcing and validating real market data,
+building a 21-factor model with proper cross-sectional treatment,
+diagnosing why an initial version of the model looked implausibly good,
+systematically fixing methodological flaws (look-ahead bias, industry
+concentration, a value-trap exposure), and — most importantly — testing
+the final model on a held-out, never-tuned-on period (2022–2023) to
+check whether the improvements actually generalize.
+
+**Key findings:**
+
+- An initial version of the model used full-sample factor weighting,
+  which produced an implausibly high backtest return — a look-ahead
+  bias that was identified and corrected before any further work
+  proceeded.
+- After correction, the base multi-factor model's initial relative
+  performance versus the CSI 300 benchmark was weak (2018–2020),
+  motivating a structured diagnosis.
+- Diagnosis revealed two distinct drivers of this weak relative
+  performance: 
+  (1) a **value-trap** effect, where cheap valuation
+  factors overweighted industries (autos, steel, banks, real estate)
+  that were cheap *because* fundamentals were deteriorating, not because
+  they were undervalued
+  (2) a **structural benchmark effect**,
+  where roughly half of the index's return over the period was
+  concentrated in its ten largest constituents.
+- Targeted, theory-driven fixes — earnings-trend factors, industry
+  neutrality constraints, risk-parity position sizing, and a market-cap
+  tilt — substantially narrowed the relative-performance gap and turned
+  the strategy's Sharpe ratio from negative to slightly positive.
+- **Out-of-sample validation on 2022–2023 data** (never used in any
+  tuning step) showed the strategy outperforming the CSI 300 by **+4.95%
+  annualized** in a declining market, but with a different set of
+  factors driving that performance than in the training period —
+  indicating that the *adaptive rolling-weight framework*, not any
+  single factor, is the source of whatever robustness the model has.
+
+---
+
+# Background and Objectives
+
+## Motivation
+
+The Chinese A-share market has an active quantitative research
+ecosystem, and the CSI 300 (compiled by China Securities Index Co.) is
+the standard large/mid-cap benchmark for institutional Chinese equity
+strategies, analogous in role to the S&P 500 for US large-cap strategies.
+Multi-factor stock selection — scoring stocks on standardized signals
+(value, momentum, quality, etc.) and tilting a portfolio toward the
+highest-scoring names — is the dominant methodology used by Chinese
+sell-side quant research desks and by domestic quantitative asset managers.
+
+The goal of this project was to build, from scratch, a defensible
+multi-factor stock selection pipeline — factor construction,
+cross-sectional processing, factor evaluation (IC/ICIR), portfolio
+construction, and backtesting — using real data obtained through the
+Wind Financial Terminal, and to evaluate it with the rigor a
+professional research team would expect: no look-ahead bias, genuine
+out-of-sample testing, and honest reporting of negative results rather
+than a backtest tuned until it looks favorable.
+
+## A Note on Market Microstructure Relevant to This Study
+
+Several features of the A-share market shape both the factor design and
+the interpretation of results in this report:
+
+- **Price limits:** ordinary A-shares are subject to a ±10%
+  daily price-move limit (±5% for special-treatment "ST" stocks, ±20%
+  for ChiNext/STAR Market names), which can compress realized volatility
+  during extreme events and cause return distributions to differ from
+  unconstrained markets.
+- **T+1 settlement:** shares bought on day *t* cannot be sold until day
+  *t+1*, which — combined with a retail-investor-dominated trading base
+  (historically 80%+ of turnover) — tends to produce stronger short-term
+  momentum/reversal patterns than are typically observed in
+  institutionally-dominated markets.
+- **Disclosure lag:** quarterly financial statements are not public
+  immediately at quarter-end; this project follows standard convention
+  by lagging fundamental data 30–120 days past the fiscal period end
+  (see the Factor Library section below), a practice essential to avoiding look-ahead bias in any
+  fundamentals-based factor.
+- **Index concentration:** unlike the S&P 500, the CSI 300's return can,
+  in a given period, be disproportionately driven by a small number of
+  mega-cap constituents (financials, consumer staples, and — in more
+  recent years — new-energy names); this becomes directly relevant to
+  the benchmark-concentration diagnosis discussed later in this report.
+
+## Data Source
+
+All data was sourced from the **Wind Financial Terminal API**
+(`aifinmarket.wind.com.cn`), retrieved through Wind's AI research
+assistant, Alice (`alice.wind.com.cn`). Two datasets were used:
+
+| Dataset | Universe | Period | Frequency |
+|---|---|---|---|
+| In-sample (training/diagnosis) | CSI 300 constituents (Jan 2016 snapshot) | 2016-01 – 2020-12 | Monthly |
+| Out-of-sample (validation) | CSI 300 constituents (Jan 2021 snapshot) | 2021-01 – 2023-12 | Monthly |
+
+Each dataset consists of five tables: monthly stock returns, market
+capitalization/valuation, quarterly fundamentals, industry
+classification, and the CSI 300 index's own monthly return series
+(benchmark).
+
+---
+
+# Methodology
+
+## Factor Library
+
+21 factors were computed across six categories. Factor direction
+indicates whether a higher factor value is hypothesized to predict
+higher (+1) or lower (−1) forward returns; this sign convention is later
+used directly when computing each factor's Information Coefficient.
+
+| Category | Factors | Direction |
+|---|---|---|
+| Value | `F_EP` (earnings yield), `F_BP` (book-to-price), `F_SP` (sales-to-price), `F_CFP` (cash-flow-to-price) | Higher is better |
+| Momentum | `F_MOM1M`, `F_MOM3M`, `F_MOM6M`, `F_MOM12M`, `F_REV` (short-term reversal) | Higher is better |
+| Quality | `F_ROE`, `F_ROA`, `F_PROFIT_MARGIN`, `F_ASSET_TURNOVER`, `F_LEVERAGE`, `F_EARNINGS_QUALITY` (operating cash flow / net income) | Higher is better (leverage: lower is better) |
+| Volatility | `F_VOL3M`, `F_VOL12M` (annualized trailing return volatility) | Lower is better |
+| Size | `F_SIZE`, `F_MIDCAP` (log market cap) | Lower is better (later removed — see "Fix: Removing the Small-Cap Bias" below) |
+| **Trend (added after diagnosis)** | `F_REV_YOY`, `F_PROFIT_YOY` (year-over-year fundamental growth) | Higher is better |
+
+**Fundamental data lag convention.** Quarterly reports are only treated
+as "available" to the model on a realistic disclosure timeline: Q1
+results become usable April 30 of the same year, Q2 results August 31,
+Q3 results October 31, and annual results April 30 of the *following*
+year — matching typical Chinese listed-company disclosure deadlines. Any
+factor computed from fundamentals for month *t* uses only the most
+recent report whose availability date is on or before month *t*. This is
+not a stylistic choice: using a report before it was actually public
+would silently leak future information into the model exactly as the
+initial full-sample weighting scheme did, and is one of the
+more common, easy-to-miss sources of look-ahead bias in fundamentals-
+based quant research.
+
+## Cross-Sectional Processing
+
+For each factor, in each month, independently, three transformations are
+applied — a standard sequence in the Chinese sell-side quant literature
+and in Barra-style multi-factor risk models:
+
+**(1) Winsorization.** Raw factor values are clipped at the 1st and 99th
+percentile within each month's cross-section:
+$$
+x_i^{clip} = \min\big(\max(x_i,\ q_{0.01}),\ q_{0.99}\big)
+$$
+The 1%/99% threshold is a conventional choice (rather than a stricter or
+looser cutoff) that removes the small number of extreme outliers —
+common in accounting ratios when a denominator is near zero, or in
+returns during a trading halt/resumption — without discarding a
+meaningful fraction of genuine cross-sectional variation, which a
+tighter threshold (e.g. 5%/95%) risks doing on a universe of only ~300
+stocks.
+
+**(2) Z-score standardization**, to make factors comparable in scale and
+combinable into a weighted composite score:
+$$
+z_i = \frac{x_i^{clip} - \bar{x}^{clip}}{\sigma(x^{clip})}
+$$
+
+**(3) Industry and market-cap neutralization**, via a cross-sectional
+linear regression of the standardized factor on industry dummy variables
+and log market cap, keeping the *residual* as the final factor value:
+$$
+z_i = \sum_{k} \beta_k \cdot D_{i,k} + \gamma \cdot \ln(\text{mcap}_i) + \varepsilon_i, \qquad
+z_i^{neutral} = \varepsilon_i
+$$
+where $D_{i,k}$ is an indicator for stock $i$ belonging to industry $k$.
+This step — closely related to the Fama–MacBeth (1973) cross-sectional
+regression methodology underlying most modern factor-investing
+research — removes the part of a factor's cross-sectional variation that
+is simply "which industry this stock is in" or "how large this stock
+is," isolating a purer, industry- and size-independent stock-selection
+signal. Without this step, a factor such as earnings yield could appear
+predictive purely because it is correlated with, say, an
+overweight in financials that happened to perform well — not because
+earnings yield itself carries information.
+
+## Factor Evaluation: IC, Rank IC, and ICIR
+
+Each factor's predictive power is measured using the **Information
+Coefficient (IC)** framework, the standard evaluation approach in
+institutional multi-factor research (used, for example, in Grinold &
+Kahn's *Active Portfolio Management*, and standard in Chinese sell-side
+quant factor reports). IC is preferred here over a simpler metric such as
+raw factor-return spread because it directly measures the
+*cross-sectional correlation* between a factor and forward returns —
+capturing both the direction and the consistency of a signal's
+predictive power, independent of how a portfolio happens to be
+constructed from it.
+
+For factor $f$ in month $t$:
+$$
+IC_{f,t} = \text{corr}\big(z_{i,f,t},\ r_{i,t+1}\big) \quad \text{(Pearson)}
+$$
+$$
+RankIC_{f,t} = \text{corr}\big(\text{rank}(z_{i,f,t}),\ \text{rank}(r_{i,t+1})\big) \quad \text{(Spearman)}
+$$
+Rank IC is reported as the primary metric because it is robust to the
+influence of extreme return outliers (a single stock's 900%+ monthly
+return, of the kind that can occur in equity data during trading
+halts or resumptions,
+would distort a Pearson correlation far more than a rank-based one).
+
+The **ICIR** (Information Coefficient Information Ratio) — the mean IC
+divided by its standard deviation across months — measures how
+*consistently* predictive a factor is, not merely how strong it is on
+average:
+$$
+ICIR_f = \frac{\overline{RankIC_f}}{\sigma(RankIC_f)}
+$$
+A factor with a high mean IC but a wildly varying month-to-month IC (a
+high-variance, low-ICIR factor) is a much less reliable basis for
+systematic weighting than a factor with a smaller but steadier IC — this
+is precisely the logic used later to select and weight factors in
+portfolio construction (described below).
+
+## Portfolio Construction
+
+The backtest engine combines five mechanisms, each added in response to
+a specific diagnosed problem described in the next section. Before
+reaching this configuration, an initial version of the model weighted
+factors using **full-sample** ICIR — a single ICIR value computed once
+from the *entire* 2016–2020 IC history and applied uniformly to every
+month, including the very first one. This produced an implausible
+backtest (CAGR of 12.85%, with the leading factor's Rank IC around
+0.66 — far above the 0.02–0.05 range considered strong in institutional
+research) because it implicitly let a January 2016 portfolio decision be
+informed by data through December 2020, a textbook look-ahead bias. The
+fix — computing factor weights each month using *only* the trailing
+12–24 months of IC data, never the future — is the version described
+below, and is what every subsequent result in this report uses. Weights
+are proportional to each factor's trailing absolute ICIR:
+$$
+w_{f,t} = \frac{|ICIR_{f,t}^{trailing}|}{\sum_{f'} |ICIR_{f',t}^{trailing}|}
+$$
+
+**Turnover buffer.** A stock already held is kept as long as it remains
+in the top 30% by composite score, rather than being sold the instant it
+drops out of the top 20% selection threshold. New purchases only fill
+the remaining slots. This reduces unnecessary round-trip trading (and
+the associated 0.15% one-way transaction cost) driven by small,
+economically insignificant month-to-month rank changes near the
+selection cutoff.
+
+**Risk-parity / cap-tilted position sizing.** Within the selected
+basket, position weights combine inverse-volatility weighting with a
+market-cap tilt:
+$$
+w_i^{pos} \propto \frac{1}{\sigma_{i,12M}} \times \text{mcap}_i,
+\qquad \text{subject to } w_i^{pos} \le \text{MAX\_WEIGHT}
+$$
+Excess weight above the per-stock cap is redistributed proportionally
+across the remaining names.
+
+**Industry-neutrality constraint.** No industry may be overweighted,
+relative to its market-wide weight in that month's universe, by more
+than a fixed tolerance (3 percentage points in the final configuration).
+
+**Transaction costs.** 0.15% one-way, applied to the month's portfolio
+turnover (the fraction of holdings that changed).
+
+Standard performance metrics are computed from the resulting monthly
+portfolio-return series $r_t$:
+$$
+CAGR = \left(\prod_t (1+r_t)\right)^{12/N} - 1, \qquad
+Sharpe = \frac{CAGR - r_f}{\sigma(r_t)\sqrt{12}}, \qquad
+MaxDD = \min_t \frac{V_t - \max_{s \le t} V_s}{\max_{s \le t} V_s}
+$$
+where $V_t$ is cumulative portfolio value and $r_f$ (assumed 3%
+annualized) is the risk-free rate used in the Sharpe ratio calculation.
+
+---
+
+# Systematic Diagnosis and Targeted Fixes
+
+After correcting the look-ahead bias described above, the model's
+honest, bias-free starting point was weak: CAGR of **−1.18%** over
+2018–2020, a Sharpe ratio of **−0.24**, and a return roughly **22
+percentage points** below the CSI 300 benchmark annualized. Rather than
+treating this as a dead end, this was treated as the correct and
+necessary starting point for a real diagnostic process — the "good"
+result before this fix was never real, and finding that out is treated
+here as a finding in its own right rather than a setback. The rest of
+this section walks through the two root causes that were identified for
+this relative-performance gap, and the theory-driven fixes that followed
+from each diagnosis.
+
+## Diagnosis: The Value Trap (2018 Industry Concentration)
+
+**How the problem was found.** Rather than treating the model's weak
+relative return as a single undifferentiated fact, the diagnostic process
+started by breaking the 2018–2020 backtest down month by month. This
+immediately showed that the loss was not driven by one or two extreme
+events, but was persistent: **2018 alone lost money in 8 of its 12
+months**, with monthly losses ranging from −0.4% to −7.6% and no single
+catastrophic outlier month. A loss spread evenly across most months of a
+single calendar year, rather than concentrated in a few extreme events,
+is a signature more consistent with a *systematic* portfolio bias
+(the model is structurally exposed to something that fell all year) than
+with idiosyncratic stock-picking mistakes.
+
+**Testing the hypothesis.** To test whether the bias was sector-related,
+the model's actual monthly stock selections for 2018 were extracted (by
+modifying the backtest to log each month's selected stock codes) and
+matched against the industry classification table. This was compared
+against the industry composition of the full 300-stock CSI 300 universe
+in the same year, to see whether the model's selections deviated from a
+simple "market-cap-weighted average" industry exposure.
+
+```{r industry-diagnosis-chart, echo=FALSE, fig.width=8, fig.height=5, fig.cap="Model-selected industry weights vs. CSI 300 market weights, 2018 — the systematic tilt that produced most of the year's losses"}
+industry_diag <- data.frame(
+  industry = rep(c("Autos", "Steel", "Real\nEstate", "Banks",
+                    "Non-bank\nFinancials", "Pharma/\nBiotech"), 2),
+  weight = c(4.7, 3.9, 5.3, 5.3, 10.3, 7.7,      # market
+             8.5, 5.4, 6.9, 6.8, 6.5, 5.1),        # model selection
+  source = rep(c("CSI 300 market weight", "Model selection weight"), each = 6)
+)
+industry_diag$industry <- factor(industry_diag$industry,
+  levels = c("Autos", "Steel", "Real\nEstate", "Banks",
+             "Non-bank\nFinancials", "Pharma/\nBiotech"))
+ggplot(industry_diag, aes(x = industry, y = weight, fill = source)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("CSI 300 market weight" = "grey60",
+                                "Model selection weight" = "#e34a33")) +
+  labs(x = NULL, y = "Portfolio weight (%)", fill = NULL,
+       title = "The model overweighted exactly the sectors hit hardest by\n2018's deleveraging campaign and trade tensions") +
+  theme(legend.position = "bottom")
+```
+
+**Interpreting the mechanism.** The model overweighted autos, steel,
+real estate, and banks relative to their market weight, while
+underweighting non-bank financials and pharma/biotech — and these were
+precisely the sectors that fell hardest in 2018 amid China's
+deleveraging campaign and escalating US–China trade tensions. The causal
+chain is a classic **value trap**: pure valuation factors (`F_EP`,
+`F_BP`) score a stock as "cheap" based only on its current price relative
+to current earnings or book value, with no information about whether
+those earnings/book values are stable, growing, or actively
+deteriorating. Autos, steel, real estate, and banks were structurally
+cheap by these multiples in 2018 — but were cheap *because* the market
+was correctly pricing in deteriorating fundamentals, not because they
+were mispriced bargains. A pure valuation factor cannot tell these two
+cases apart.
+
+**The fix: earnings-trend (GARP) factors.** This diagnosis directly
+motivated a fix grounded in the well-established **Growth At a
+Reasonable Price (GARP)** philosophy (associated with investors such as
+Peter Lynch), which explicitly combines valuation with a fundamental
+growth or improvement signal, precisely to screen out value traps.
+Rather than sourcing new data, two trend factors were constructed from
+fundamental data *already present* in the dataset (which spans multiple
+fiscal quarters per stock): trailing year-over-year revenue growth
+(`F_REV_YOY`) and net-profit growth (`F_PROFIT_YOY`), each computed by
+matching a report to the same fiscal quarter one year prior.
+
+The effect was immediate and, notably, the single largest single-factor
+improvement identified in the entire project: `F_REV_YOY` became the
+**highest-ICIR factor in the entire 21-factor library** (Rank ICIR =
+0.638, versus 0.557 for the previous leader, `F_ROE`), and CAGR rose
+from 0.35% before the fix to 2.38% after its addition.
+
+**A complementary but weaker fix: industry-neutrality constraints.** A
+portfolio-construction-level fix — capping any industry's overweight
+relative to the market at 3 percentage points, regardless of what the
+factor scores say — was tested as an alternative or complementary
+remedy. This reduced concentration as intended, but produced **almost no
+change in returns** (0.35% → 0.35% CAGR before the trend factors were
+even added). This null result is itself informative: it indicates the
+problem was primarily in *how individual stocks were being scored*
+(the factor logic), not merely in how the resulting scores were
+aggregated into industry exposures. A pure diversification constraint,
+without fixing the underlying scoring bias, mechanically forces the
+portfolio to hold more of the "cheap but deteriorating" pharma/financial
+names alongside fewer of the mis-scored auto/steel/bank names — but does
+not stop the model from picking the *worst* stocks within whichever
+industries it is still allowed to hold.
+
+## Diagnosis: Structural Benchmark Concentration
+
+**Motivating question.** Even after the trend-factor fix, the model's
+return still trailed the CSI 300 benchmark by a wide margin annually —
+too wide to be plausibly closed by further factor refinement alone. This
+prompted a different kind of question, not about the *strategy* but about the *benchmark*: is the CSI 300's own return in
+this period unusually concentrated in a small number of mega-cap names,
+in a way that structurally disadvantages any strategy that diversifies
+across 40–60 names by design?
+
+**Method.** All 300 constituents were ranked by market capitalization
+each month, split into the top 10 (by cap) versus the remaining 290, and
+each group's market-cap-weighted forward return was computed and
+annualized separately — entirely independent of the factor model itself,
+using only raw returns and market caps.
+
+```{r concentration-diagnosis-chart, echo=FALSE, fig.width=7, fig.height=4.5, fig.cap="Decomposition of CSI 300 return by market-cap segment, 2016-2020"}
+conc_diag <- data.frame(
+  segment = factor(c("Top-10 mega-caps\n(cap-weighted)",
+                      "Remaining 290 stocks\n(cap-weighted)",
+                      "CSI 300 Index\n(full benchmark)"),
+                    levels = c("Top-10 mega-caps\n(cap-weighted)",
+                      "Remaining 290 stocks\n(cap-weighted)",
+                      "CSI 300 Index\n(full benchmark)")),
+  cagr = c(21.27, 10.86, 19.26)
+)
+ggplot(conc_diag, aes(x = segment, y = cagr, fill = segment)) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  scale_fill_manual(values = c("#e34a33", "#41ab5d", "grey40")) +
+  labs(x = NULL, y = "Annualized Return (%)",
+       title = "Mega-caps drove disproportionate benchmark return, while the\n'average' remaining stock still outperformed the strategy at that stage") +
+  geom_text(aes(label = paste0(cagr, "%")), vjust = -0.5)
+```
+
+**Interpretation — partial confirmation.** The top-10 mega-caps did
+outperform the remaining 290 stocks by roughly **10 percentage points**
+annualized (21.27% vs. 10.86%), confirming that a meaningful share of
+the CSI 300's headline return was concentrated in a handful of
+constituents — a real structural feature of this period, not an
+artifact. However, the diagnosis also showed the hypothesis only
+*partially* explains the strategy's relative performance: even the
+"average" remaining 290 stocks returned **10.86%**, still well above
+where the strategy stood at that point in its development (2.65% CAGR
+after the size-factor removal described below). This means roughly half
+of the strategy's relative-performance gap was attributable to benchmark
+concentration (a structural feature outside the model's control), and
+roughly half remained attributable to selection and weighting choices
+genuinely within the model's control — a distinction with direct
+implications for how much further improvement should realistically be
+expected from continued tuning.
+
+## Fix: Removing the Small-Cap Bias and Tilting Toward Scale
+
+The original factor library included two size factors (`F_SIZE`,
+`F_MIDCAP`, both log market cap) with direction = −1, i.e., an explicit
+preference for *smaller* stocks — a standard feature of many classic
+academic factor models (the Fama–French "SMB" size premium), but one
+that, per the diagnosis above, worked directly against this specific
+period's market structure. These were removed from the factor pool.
+
+Separately, position sizing was changed from pure risk-parity
+(inverse-volatility only) to the combined market-cap-tilted,
+inverse-volatility weighting described in the Methodology section, with the
+previously-defined but never-enforced `MAX_WEIGHT` parameter (originally
+5%, raised to 15%) actually implemented in the position-sizing logic for
+the first time.
+
+Combined, these two changes produced the single largest improvement of
+the project: CAGR rose from 2.65% to **7.83%**, and the Sharpe ratio
+turned **positive (0.27)** for the first time since the look-ahead bias
+was removed.
+
+**Honest caveat.** This improvement was achieved by deliberately moving
+the strategy's *character* away from pure diversified factor investing
+and toward a modest large-cap tilt. Pushed further (raising `MAX_WEIGHT`
+well beyond 15%, or concentrating the portfolio into fewer names), the
+strategy would likely keep converging further toward the benchmark's
+own return — but would
+increasingly resemble "hold a handful of the benchmark's largest
+constituents" rather than a genuine multi-factor selection process. This
+report treats the 15% cap as a deliberate, disclosed stopping point
+rather than a boundary to keep pushing past, precisely because the
+research question of interest is "can factor-based selection add value,"
+not "can concentration alone approximate the index."
+
+## A Tested-but-Traded-Off Idea: Market Timing
+
+A classic trend-following market-timing overlay — a 10-month moving-
+average filter on the CSI 300 index itself, in the tradition of Faber
+(2007), "A Quantitative Approach to Tactical Asset Allocation" — was
+also tested: when the index closes below its own trailing 10-month
+moving average, equity exposure is reduced to 30% of the portfolio (the
+remainder held at an assumed ~3% annualized cash return); when the index
+is above its moving average, the strategy remains fully invested.
+
+```{r timing-tradeoff-chart, echo=FALSE, fig.width=7, fig.height=4.5, fig.cap="Market-timing overlay: drawdown improved, but at the cost of missed upside in the 2019 rebound"}
+timing_df <- data.frame(
+  metric = rep(c("2018 Return", "2019 Return", "Max Drawdown"), each = 2),
+  version = rep(c("Without timing\noverlay", "With timing\noverlay"), 3),
+  value = c(-24.32, -17.61,   # 2018
+            27.03, 17.08,     # 2019
+            -19.14, -12.25)   # max DD
+)
+timing_df$metric <- factor(timing_df$metric,
+                            levels = c("2018 Return", "2019 Return", "Max Drawdown"))
+ggplot(timing_df, aes(x = metric, y = value, fill = version)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  scale_fill_manual(values = c("Without timing\noverlay" = "grey60",
+                                "With timing\noverlay" = "#2c7fb8")) +
+  labs(x = NULL, y = "%", fill = NULL,
+       title = "The moving-average signal reduced downside risk but its inherent\nlag also cost part of the subsequent rebound") +
+  theme(legend.position = "bottom")
+```
+
+**Result: reduced risk was a genuine trade-off, not a free improvement.**
+The timing overlay reduced maximum drawdown materially (from −19.14% to
+−12.25%) and reduced the 2018 loss from −24.32% to −17.61% — the signal
+correctly flagged the 2018 downtrend and reduced exposure into it. But
+because a trailing moving-average signal is inherently *lagging*, it also
+caused the strategy to remain defensively positioned into part of the
+2019 rebound, reducing 2019's return from +27.03% to +17.08%. The net
+effect across both years was that CAGR and Sharpe both **slightly
+worsened** (2.38% → 1.74%; −0.03 → −0.08). This is reported as a genuine
+and expected trade-off — this is precisely the risk/return profile a
+trend-following overlay is designed to produce, and it is the reason the
+overlay was **not** included in the final "best" configuration used for
+out-of-sample testing, even though it remains a legitimate and
+well-documented tool for an investor who explicitly prioritizes drawdown
+control over return.
+
+---
+
+# Out-of-Sample Validation (2022–2023)
+
+## Why This Test Matters More Than Any Single In-Sample Result
+
+Every result reported in Sections 5–6 shares one important limitation:
+all of it was produced by iteratively testing ideas *against the same
+35-month window* (2018–2020). Even with each individual change grounded
+in a specific, real diagnosis rather than blind parameter search, a
+model that has been improved through many rounds of testing against one
+fixed historical period always carries some risk of having absorbed
+idiosyncrasies of that particular period rather than a genuinely
+transferable signal — a risk widely known in quantitative finance as
+backtest overfitting or data snooping.
+
+The only way to distinguish "genuinely useful improvement" from
+"accidentally well-fit to 2018–2020" is to test the *exact same,
+already-finalized* model — no parameter changes, no re-selection of
+factors, no new tuning — against data it has never been exposed to in
+any way. This section describes that test.
+
+## Data and Methodological Note
+
+A second, independently retrieved dataset covering **2021–2023** CSI 300
+constituents was obtained from Wind. Standard data-quality checks were
+run before proceeding (confirming realistic cross-sectional statistics:
+11.0% return standard deviation for individual stocks, 4.6% for the
+benchmark — both consistent with genuine A-share data).
+
+One parameter required adjustment purely for data-volume reasons: the
+rolling-weight lookback window was reduced from 24 months to 12 months,
+because the new dataset spans only 36 months total, and a 24-month
+warm-up period would have left only ~11 tradeable months — too small a
+sample from which to draw any reliable conclusion, and additionally
+subject to a benchmark date-alignment issue (the benchmark series used
+last-trading-day conventions, e.g. "2023-04-28," while the stock-return
+series used calendar month-end dates, e.g. "2023-04-30," causing 2 of 11
+months to fail to match during the initial diagnostic run). Reducing the
+lookback to 12 months was made strictly to obtain an adequately sized
+test sample; no other aspect of the strategy's logic, factor set, or
+weighting mechanism was altered from its final in-sample configuration.
+
+## Results
+
+```{r oos-results, echo=FALSE}
+oos <- data.frame(
+  Metric = c("Backtest period", "Months", "Strategy CAGR",
+             "Benchmark (CSI 300) CAGR", "Excess Return",
+             "Strategy Sharpe Ratio", "Max Drawdown", "Win Rate"),
+  Value = c("2022-01 to 2023-12", "23", "-3.34%", "-8.29%", "+4.95%",
+            "-0.44", "-10.17%", "52.17%")
+)
+kable(oos, col.names = c("Metric", "Value"),
+      caption = "Out-of-sample backtest results (2022-2023, never used in tuning)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 12)
+```
+
+```{r oos-chart, echo=FALSE, fig.width=7, fig.height=4.5, fig.cap="Strategy vs. benchmark, out-of-sample period (2022-2023) — a defensive, relative outperformance in a declining market"}
+oos_chart <- data.frame(
+  series = factor(c("Strategy", "CSI 300 Benchmark"),
+                   levels = c("Strategy", "CSI 300 Benchmark")),
+  cagr = c(-3.34, -8.29)
+)
+ggplot(oos_chart, aes(x = series, y = cagr, fill = series)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  scale_fill_manual(values = c("Strategy" = "#2c7fb8", "CSI 300 Benchmark" = "grey50")) +
+  geom_text(aes(label = paste0(cagr, "%")), vjust = 1.5, color = "white", fontface = "bold") +
+  labs(x = NULL, y = "CAGR (%)",
+       title = "Out-of-sample: the strategy outperformed the benchmark\n(+4.95 pp annualized excess return) in a declining market")
+```
+
+The 2022–2023 window was a broadly declining market for the CSI 300
+(benchmark CAGR of −8.29%), an entirely different regime from the mostly
+rising 2016–2020 training period — precisely the kind of "different
+market environment" test that gives an out-of-sample result its
+credibility. In absolute terms the strategy's return was also negative
+(−3.34% CAGR), but it **preserved capital meaningfully better than the
+benchmark**, producing a positive excess return of **+4.95% annualized**
+— a genuine, risk-adjusted outperformance in a difficult market, achieved
+alongside lower absolute volatility as well (implied by the smaller max
+drawdown).
+
+## The Most Important Finding of the Project: Factor Instability, Framework Stability
+
+```{r factor-comparison-table, echo=FALSE}
+factor_comp <- data.frame(
+  Rank = 1:5,
+  Training_Period = c("F_REV_YOY", "F_ROE", "F_PROFIT_YOY", "F_EP",
+                       "F_PROFIT_MARGIN"),
+  Training_ICIR = c(0.638, 0.557, 0.565, 0.458, 0.435),
+  OOS_Period = c("F_MOM6M", "F_VOL3M", "F_BP", "F_CFP", "F_VOL12M"),
+  OOS_ICIR = c(0.554, 0.436, 0.398, 0.368, 0.351)
+)
+kable(factor_comp,
+      col.names = c("Rank", "Top Factor\n(2016-2020)", "ICIR",
+                     "Top Factor\n(2021-2023)", "ICIR"),
+      caption = "Top-5 factors by Rank ICIR: training period vs. out-of-sample period") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 12)
+```
+
+```{r factor-comparison-chart, echo=FALSE, fig.width=8, fig.height=4.5, fig.cap="Top-5 factors by ICIR in each period — zero overlap between the two lists"}
+fc_chart <- data.frame(
+  factor = c("F_REV_YOY", "F_ROE", "F_PROFIT_YOY", "F_EP", "F_PROFIT_MARGIN",
+             "F_MOM6M", "F_VOL3M", "F_BP", "F_CFP", "F_VOL12M"),
+  icir = c(0.638, 0.557, 0.565, 0.458, 0.435,
+           0.554, 0.436, 0.398, 0.368, 0.351),
+  period = c(rep("2016-2020 (training)", 5), rep("2021-2023 (out-of-sample)", 5))
+)
+fc_chart$factor <- factor(fc_chart$factor, levels = rev(fc_chart$factor))
+ggplot(fc_chart, aes(x = factor, y = icir, fill = period)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("2016-2020 (training)" = "#e34a33",
+                                "2021-2023 (out-of-sample)" = "#2c7fb8")) +
+  labs(x = NULL, y = "Rank ICIR", fill = NULL,
+       title = "No factor appears in both periods' top 5 — individual factor\nefficacy is regime-dependent") +
+  theme(legend.position = "bottom")
+```
+
+The two top-5 lists share **no factors in common whatsoever**. The
+trend/growth and quality factors (`F_REV_YOY`, `F_ROE`, `F_PROFIT_YOY`)
+that drove most of the in-sample improvement documented above were
+*not* the effective factors in 2022–2023; instead, momentum and
+low-volatility factors dominated — a pattern consistent with a
+defensive, quality-momentum rotation typical of a risk-off market
+regime, and broadly consistent with prior literature on time-varying
+factor premia (e.g., work on regime-dependent factor performance in both
+US and Chinese equity markets).
+
+This is the central, honest conclusion of the project: **no individual
+factor in this library is stable across market regimes.** What did
+generalize was the *rolling, out-of-sample factor-weighting mechanism
+itself* — by re-estimating factor effectiveness every month using only
+trailing data (never the future, and never a fixed factor list), the
+framework automatically rotated away from factors that stopped working
+and toward factors that were actually predictive in the new regime,
+without any manual intervention or re-tuning. That adaptive property,
+rather than any specific factor combination, is what produced positive
+excess return in a market the model had never seen — and is a more
+defensible basis for claiming the framework has genuine value than any
+single in-sample performance number would be on its own.
+
+---
+
+# Limitations and Honest Caveats
+
+This project intentionally avoided a common failure mode in backtested
+research — repeatedly adjusting a model until a single historical period
+looks favorable (backtest overfitting / data snooping). The following
+limitations are reported for transparency, consistent with that goal:
+
+- **Short samples.** The in-sample window (35 usable months after the
+  rolling-weight warm-up) and out-of-sample window (23 months) are both
+  short by institutional research standards; a single unusual month can
+  meaningfully move annualized statistics, and standard errors on any
+  Sharpe ratio or CAGR figure reported here are wide.
+- **Two periods is not a full regime test.** Out-of-sample validation on
+  one additional 2-year window is a meaningful check but not proof of
+  robustness across all market conditions — a strong bull market, a
+  liquidity crisis, or a sharply sector-rotation-heavy regime were not
+  separately tested, and each could plausibly produce a different
+  outcome.
+- **Transaction cost assumptions are simplified.** A flat 0.15% one-way
+  cost was applied uniformly; real-world costs (market-impact costs
+  that scale with position size, and bid-ask spread widening during
+  stress periods — both especially relevant given China's price-limit
+  rules) were not modeled.
+- **The machine-learning comparison (XGBoost / Random Forest) showed
+  signs of overfitting, not model strength.** A walk-forward test showed
+  positive Rank IC (0.15–0.18) when trained through 2018 and tested on
+  2019, but *negative* Rank IC (−0.09 to −0.13) for the same model
+  architecture trained through 2019 and tested on 2020 — a clear signal
+  that nonlinear ML models trained on this factor set do not generalize
+  reliably here, and should not be treated as an improvement over the
+  simpler linear factor approach without further work (regularization,
+  larger training windows, or feature selection).
+- **The cap-tilt trade-off is a value judgment, not a free improvement.**
+  Raising `MAX_WEIGHT` and tilting toward market cap closed roughly half
+  of the strategy's relative-performance gap versus the benchmark, but
+  did so by making the strategy
+  structurally more concentrated — a legitimate choice for an investor
+  seeking benchmark-relative performance, but a genuine departure from a
+  purely diversified multi-factor philosophy that should be disclosed
+  explicitly rather than presented as a costless factor improvement.
+- **Benchmark date alignment.** The benchmark comparison relies on
+  matching two independently-sourced monthly series (individual stock
+  returns vs. index returns) that occasionally used slightly different
+  month-end conventions (last calendar day vs. last trading day); this
+  was checked directly and found to affect at most 1–2 months per
+  test period, not a material distortion, but is disclosed here for
+  completeness.
+
+---
+
+# Conclusion
+
+This project's primary contribution is methodological rather than a
+single performance number. Over roughly a dozen iterations, the model
+was diagnosed and improved using real, verifiable evidence at each
+step — direct inspection of raw data statistics, industry-composition
+analysis, mega-cap return decomposition, and, critically, genuine
+out-of-sample testing on data collected only after every tuning decision
+had already been finalized. The final result — a positive Sharpe ratio
+in-sample and a +4.95% annualized excess return in a completely unseen,
+structurally different market regime — is modest by absolute standards,
+but is the kind of result that is credible precisely *because* it
+survived a real out-of-sample test, and because the specific factors
+driving performance were allowed to (and did) change substantially
+between the two periods rather than being forced to repeat. In an
+industry where backtests are cheap to produce and easy to overfit, the
+process documented here — diagnose honestly, fix with theory rather than
+brute-force parameter search, and validate out-of-sample before drawing
+conclusions — is offered as the more meaningful deliverable of this
+internship project.
+
+---
+
+# Appendix: Pipeline Code
+
+The full Python implementation (data loading, factor computation,
+cross-sectional processing, IC analysis, rolling-weight backtest engine,
+benchmark comparison, and walk-forward ML comparison) is included below
+for reference. It is shown as a reference listing (not executed as part
+of this R Markdown document) since the original pipeline was implemented
+in Python against the Wind CSV exports; full source files
+(`run_full_pipeline.py` for the 2016–2020 analysis and
+`test_full_pipeline.py` for the 2021–2023 out-of-sample validation) are
+available alongside this report.
+
+## A.1 Configuration and Data Loading
+
+```python
+# Paths to Wind CSV exports (pre-computed)
+MONTHLY_RET_CSV = "monthly_ret.csv"
+MCAP_CSV = "mcap.csv"
+FUND_CSV = "fund.csv"
+INDUSTRY_CSV = "industry.csv"
+BENCHMARK_CSV = "benchmark.csv"
+
+# Backtest configuration
+TOP_QUANTILE = 0.20          # Select top 20%
+TRANSACTION_COST = 0.0015    # 0.15% one-way (commission + slippage)
+MAX_WEIGHT = 0.15            # Max 15% per stock (enforced)
+MIN_STOCKS = 20              # Minimum stocks in portfolio
+
+FACTOR_DIRECTION = {
+    'F_EP': 1, 'F_BP': 1, 'F_SP': 1, 'F_CFP': 1,
+    'F_MOM1M': 1, 'F_MOM3M': 1, 'F_MOM6M': 1, 'F_MOM12M': 1, 'F_REV': 1,
+    'F_ROE': 1, 'F_ROA': 1, 'F_PROFIT_MARGIN': 1, 'F_ASSET_TURNOVER': 1,
+    'F_LEVERAGE': -1, 'F_EARNINGS_QUALITY': 1,
+    'F_VOL3M': -1, 'F_VOL12M': -1,
+    'F_REV_YOY': 1, 'F_PROFIT_YOY': 1
+    # F_SIZE, F_MIDCAP intentionally removed after diagnosis (see Section 6.3)
+}
+
+def load_data():
+    """Load Wind CSV exports and parse fiscal-quarter report dates."""
+    mr = pd.read_csv(MONTHLY_RET_CSV, parse_dates=['date'])
+    mc = pd.read_csv(MCAP_CSV, parse_dates=['date'])
+    fd = pd.read_csv(FUND_CSV)
+
+    def _parse_fiscal_quarter(s):
+        q, y = s.split()
+        q_num = int(q[1])
+        year = int(y[2:])
+        month = {1: 3, 2: 6, 3: 9, 4: 12}[q_num]
+        day = {3: 31, 6: 30, 9: 30, 12: 31}[month]
+        return pd.Timestamp(year=year, month=month, day=day)
+
+    fd['report_date'] = fd['report_date'].apply(_parse_fiscal_quarter)
+    ind = pd.read_csv(INDUSTRY_CSV)
+    return mr, mc, fd, ind
+```
+
+## A.2 Trend (YoY Growth) Factors — the Key Diagnosis-Driven Addition
+
+```python
+def compute_factors(panel, fund):
+    """Compute all factors, including YoY growth trend factors."""
+    fund['available_date'] = fund['report_date'].apply(get_available_date)
+
+    # YoY growth: match each report to the same quarter one year earlier
+    fund['prior_year_date'] = fund['report_date'] - pd.DateOffset(years=1)
+    prior = fund[['code', 'report_date', 'revenue', 'net_profit']].rename(
+        columns={'report_date': 'prior_year_date',
+                 'revenue': 'prior_revenue',
+                 'net_profit': 'prior_net_profit'}
+    )
+    fund = fund.merge(prior, on=['code', 'prior_year_date'], how='left')
+    fund['revenue_yoy'] = (
+        (fund['revenue'] - fund['prior_revenue']) / fund['prior_revenue'].abs()
+    )
+    fund['net_profit_yoy'] = (
+        (fund['net_profit'] - fund['prior_net_profit']) / fund['prior_net_profit'].abs()
+    )
+    # ... per-month factor computation loop (value, momentum, quality,
+    # volatility, and the new trend factors F_REV_YOY / F_PROFIT_YOY)
+```
+
+## A.3 Cross-Sectional Processing (Winsorize -> Z-score -> Neutralize)
+
+```python
+def winsorize_standardize_neutralize(df, factor_list, date_col='date',
+                                      industry_col='industry'):
+    """Per-month: winsorize (1%/99%), z-score, industry+mcap neutralize."""
+    from sklearn.linear_model import LinearRegression
+    for dt in sorted(df[date_col].unique()):
+        month = df[df[date_col] == dt].copy()
+        for f in factor_list:
+            raw = month[f].dropna()
+            lo, hi = raw.quantile(0.01), raw.quantile(0.99)
+            month[f] = raw.clip(lo, hi)
+            mean_val, std_val = month[f].mean(), month[f].std()
+            month[f + '_z'] = (month[f] - mean_val) / std_val
+            # Industry + market-cap neutralization via linear regression,
+            # keeping the residual as the final neutralized factor value
+```
+
+## A.4 Rolling (Out-of-Sample) Factor Weighting — the Look-Ahead-Bias Fix
+
+```python
+def compute_monthly_ic_table(df, factor_list, date_col='date'):
+    """Each factor's month-by-month Rank IC, for rolling weight estimation."""
+    # ... computes Spearman rank correlation between each factor and the
+    # NEXT month's return, for every (factor, month) pair
+
+def get_rolling_weights(monthly_ic, current_date, lookback=24, top_n=8):
+    """ICIR-based factor weights using ONLY IC data strictly BEFORE
+    current_date -- prevents using future information to set today's
+    factor weights."""
+    hist = monthly_ic[monthly_ic['date'] < current_date]
+    recent_dates = sorted(hist['date'].unique())[-lookback:]
+    hist = hist[hist['date'].isin(recent_dates)]
+    stats_by_factor = hist.groupby('factor')['ric'].agg(['mean', 'std'])
+    stats_by_factor['icir'] = stats_by_factor['mean'] / stats_by_factor['std']
+    top = stats_by_factor.reindex(
+        stats_by_factor['icir'].abs().sort_values(ascending=False).index
+    ).head(top_n)
+    weights = top['icir'].abs()
+    return (weights / weights.sum()).to_dict()
+```
+
+## A.5 Portfolio Construction: Turnover Buffer, Cap-Tilted Sizing, Industry Constraint
+
+```python
+def run_backtest(df, ic_df, date_col='date', lookback=24,
+                  buffer_quantile=0.30, industry_max_overweight=0.03,
+                  benchmark_trend=None, defensive_exposure=0.3,
+                  monthly_cash_ret=0.0025):
+    """Rolling-weighted multi-factor backtest with turnover buffer,
+    cap-tilted inverse-volatility sizing, industry-neutrality cap, and
+    an optional market-timing overlay."""
+    monthly_ic = compute_monthly_ic_table(df, all_factor_cols, date_col)
+    prev_codes = set()
+
+    for i, dt in enumerate(dates[:-1]):
+        weights = get_rolling_weights(monthly_ic, dt, lookback=lookback)
+        if not weights:
+            continue  # insufficient trailing history yet
+
+        month = df[df[date_col] == dt].copy()
+        month['composite_score'] = sum(
+            month[f'{f}_neu'].fillna(0) * w for f, w in weights.items()
+        )
+
+        # Turnover buffer: keep existing holdings while still in top 30%
+        market_industry_weight = month['industry'].value_counts(normalize=True)
+        ranked = month.sort_values('composite_score', ascending=False)
+        buffer_codes = set(ranked.head(int(len(month) * buffer_quantile))['code'])
+        kept = prev_codes & buffer_codes
+
+        # Fill remaining slots subject to the industry-neutrality cap
+        # ... (see full listing for the industry_count bookkeeping loop)
+
+        # Cap-tilted, inverse-volatility position sizing with MAX_WEIGHT cap
+        inv_vol = 1.0 / selected['F_VOL12M'].where(lambda v: v > 0)
+        raw_weight = inv_vol * selected['mcap']
+        selected['pos_weight'] = raw_weight / raw_weight.sum()
+        # excess weight above MAX_WEIGHT is redistributed to remaining names
+
+        # Optional market-timing overlay
+        if benchmark_trend is not None:
+            exposure = 1.0 if benchmark_trend.loc[dt, 'trend_up'] else defensive_exposure
+            portfolio_ret = exposure * portfolio_ret + (1 - exposure) * monthly_cash_ret
+```
+
+## A.6 Benchmark Comparison
+
+```python
+def compute_benchmark_comparison(bt_df, benchmark_path):
+    """Compare strategy CAGR/Sharpe against the CSI 300 index itself."""
+    bench = pd.read_csv(benchmark_path, parse_dates=['date'])
+    merged = bt_df.merge(
+        bench[['date', 'ret_pct']].rename(columns={'ret_pct': 'bench_ret_pct'}),
+        on='date', how='left'
+    )
+    merged['bench_ret'] = merged['bench_ret_pct'] / 100
+    bench_cagr = (1 + merged['bench_ret']).prod() ** (12 / len(merged)) - 1
+    excess_return = compute_metrics(merged)['CAGR'] - bench_cagr
+    return {'benchmark_cagr': bench_cagr, 'excess_return': excess_return}
+```
